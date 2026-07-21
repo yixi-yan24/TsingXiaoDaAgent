@@ -34,7 +34,7 @@ def parse_all() -> list[MinorProgram]:
     dept_pattern = re.compile(r"^##\s+(.+?学院|.+?系|.+?书院)$")
     section_pattern = re.compile(r"^##\s+")
 
-    for line in lines:
+    for index, line in enumerate(lines):
         stripped = line.strip()
 
         # Detect minor program start
@@ -50,7 +50,7 @@ def parse_all() -> list[MinorProgram]:
                 buffer = []
 
             name = prog_match.group(1).strip()
-            current = MinorProgram(name=name, department=_guess_department(lines, lines.index(line)))
+            current = MinorProgram(name=name, department=_guess_department(lines, index))
             in_program = True
             buffer = [stripped]
         elif dept_match and not prog_match:
@@ -144,6 +144,9 @@ def load_minors(force_reload: bool = False) -> list[MinorProgram]:
 
 def get_minor_by_name(name: str, minors: list[MinorProgram]) -> Optional[MinorProgram]:
     """Find a minor program by name (partial match)."""
+    name = name.strip()
+    if not name:
+        return None
     for m in minors:
         if name in m.name or m.name in name:
             return m
@@ -156,12 +159,24 @@ def get_minor_by_name(name: str, minors: list[MinorProgram]) -> Optional[MinorPr
 
 def search_minors(query: str, minors: list[MinorProgram]) -> list[MinorProgram]:
     """Search minors by keyword in name, department, or raw_text."""
-    q = query.lower()
-    results = []
+    q = query.strip().lower()
+    if not q:
+        return []
+    scored = []
     for m in minors:
-        if q in m.name.lower() or q in m.department.lower() or q in m.raw_text.lower()[:1000]:
-            results.append(m)
-    return results
+        if q in m.name.lower():
+            score = 100
+        elif q in m.department.lower():
+            score = 70
+        elif q in m.prerequisites.lower() or q in m.major_restrictions.lower():
+            score = 50
+        elif q in m.raw_text.lower():
+            score = 30
+        else:
+            continue
+        scored.append((score, m))
+    scored.sort(key=lambda item: (-item[0], item[1].name))
+    return [minor for _, minor in scored]
 
 
 def get_all_minor_names(minors: list[MinorProgram]) -> list[str]:

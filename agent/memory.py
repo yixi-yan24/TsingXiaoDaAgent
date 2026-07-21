@@ -15,8 +15,11 @@ class ShortTermMemory:
     def __init__(self, max_turns: int = 20):
         self.messages: list[Message] = []
         self.max_turns = max_turns
+        self.max_message_characters = 6_000
 
     def add(self, role: str, content: str, tool_name: Optional[str] = None):
+        if len(content) > self.max_message_characters:
+            content = content[:self.max_message_characters] + "\n[内容已截断]"
         self.messages.append(Message(role=role, content=content, tool_name=tool_name))
         if len(self.messages) > self.max_turns * 2:
             # Keep system prompt + recent history

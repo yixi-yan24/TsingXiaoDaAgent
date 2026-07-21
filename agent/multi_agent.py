@@ -1,8 +1,8 @@
 import json, re
-import httpx
 from .memory import ShortTermMemory, LongTermMemory
 from .tools import Tools
 from .course_graph import parse_courses_from_table, topological_sort, format_plan, build_prerequisite_graph
+from .llm_client import chat_completion
 
 
 class SpecialistAgent:
@@ -23,21 +23,17 @@ class SpecialistAgent:
         return response
 
     def _call_llm(self, temperature: float = 0.3) -> str:
-        messages = [{"role": m.role, "content": m.content} for m in self.memory.get_all()]
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": "deepseek-chat",
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": 2048
-        }
-        with httpx.Client(timeout=60) as client:
-            resp = client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
+        # Preserve tool_name metadata in tool messages (maintenance safety).
+        messages = []
+        for m in self.memory.get_all():
+            content = m.content
+            if m.role == "tool" and m.tool_name:
+                content = f"[工具 {m.tool_name}] 结果: {content}"
+            messages.append({"role": m.role, "content": content})
+        return chat_completion(
+            self.api_key, self.base_url, messages,
+            temperature=temperature, max_tokens=2048, timeout=60, retries=1,
+        )
 
 
 # === Specialized Agent Definitions ===
@@ -104,9 +100,18 @@ class MultiAgentSystem:
         return {"major": "", "grade": "", "interests": ""}
 
     def search_recommendations(self, profile: dict, ltm: LongTermMemory) -> str:
-        """Search and recommend minors based on profile."""
-        minors_overview = "\n".join(f"- {m.name} ({m.department}) 限制: {m.major_restrictions[:80]}"
-                                     for m in ltm.minors[:20])
+        """Search and recommend minors based on profile.
+
+        Uses semantic search to pre-filter the full minor list so every one of
+        the 44 programs has a chance to be recommended, not just the first 20.
+        """
+        # ── pre-filter: surface the most relevant minors ────────────────
+        candidates = self._pre_filter(profile, ltm, top_k=20)
+
+        minors_overview = "\n".join(
+            f"- {m.name} ({m.department}) 限制: {m.major_restrictions[:80]}"
+            for m in candidates
+        )
         task = (
             f"学生档案：\n"
             f"主修：{profile.get('major', '未知')}\n"
@@ -116,6 +121,39 @@ class MultiAgentSystem:
             f"请推荐最适合的 3-5 个辅修专业。"
         )
         return self.search_agent.think(task)
+
+    @staticmethod
+    def _pre_filter(profile: dict, ltm: LongTermMemory, top_k: int = 20):
+        """Return the *top_k* minors most relevant to the student profile.
+
+        Tries semantic search first; falls back to keyword scoring.
+        """
+        all_minors = ltm.minors
+        if len(all_minors) <= top_k:
+            return all_minors
+
+        interests = profile.get("interests", "")
+        major = profile.get("major", "")
+        query = f"{major} {interests}".strip()
+
+        # 1) Semantic search (embedding-based) — covers all programs.
+        if query:
+            try:
+                from .embedding import semantic_search as _semantic_search
+                results = _semantic_search(query, all_minors, top_k=top_k)
+                return [m for m, _ in results]
+            except Exception:
+                pass
+
+        # 2) Keyword fallback — still scans ALL minors.
+        if query:
+            from .data_loader import search_minors as _search_minors
+            kw_results = _search_minors(query, all_minors)
+            if kw_results:
+                return kw_results[:top_k]
+
+        # 3) Last resort: return first top_k (better than silently hiding half).
+        return all_minors[:top_k]
 
     def verify_plan(self, plan_text: str, program_text: str) -> str:
         """Verify a generated plan for correctness."""

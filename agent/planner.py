@@ -1,9 +1,9 @@
 import json
-import httpx
 from .prompts import PLANNER_PROMPT
 from .memory import LongTermMemory
 from .course_graph import parse_courses_from_table, topological_sort, format_plan
 from .multi_agent import MultiAgentSystem
+from .llm_client import chat_completion
 
 
 class CoursePlanner:
@@ -26,6 +26,8 @@ class CoursePlanner:
             return f"未找到辅修专业: {minor_name}"
 
         # ========== 创新1: 算法拓扑排序规划 ==========
+        # Some programs do not explicitly label required course groups in their tables.
+        # Keep the full table here rather than silently omitting required coursework.
         courses = parse_courses_from_table(prog.raw_text)
         if courses:
             algo_plan = topological_sort(courses)
@@ -94,22 +96,7 @@ class CoursePlanner:
             return f"生成计划时出错: {e}\n\n算法生成的参考计划：\n{algo_text}"
 
     def _call_llm(self, messages: list[dict]) -> str:
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": "deepseek-chat",
-            "messages": messages,
-            "temperature": 0.3,
-            "max_tokens": 4096
-        }
-        with httpx.Client(timeout=90) as client:
-            resp = client.post(
-                f"{self.base_url}/chat/completions",
-                headers=headers,
-                json=payload
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return data["choices"][0]["message"]["content"]
+        return chat_completion(
+            self.api_key, self.base_url, messages,
+            temperature=0.3, max_tokens=4096, timeout=90, retries=1,
+        )
