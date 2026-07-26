@@ -1,7 +1,6 @@
 import json, re
-from collections.abc import Generator
+import httpx
 from .memory import ShortTermMemory, LongTermMemory
-from .llm_client import chat_completion, chat_completion_stream
 from .tools import Tools
 from .planner import CoursePlanner
 from .prompts import SYSTEM_PROMPT
@@ -78,7 +77,9 @@ class AgentSession:
     def process_message(self, user_message: str, temperature: float = 0.3) -> str:
         """Process a user message and return the agent response."""
         self.stm.add("user", user_message)
-        response = self._call_llm(temperature=temperature)
+
+        # Get response from LLM
+        response = self._call_llm()
         self.stm.add("assistant", response)
         return response
 
@@ -112,36 +113,8 @@ class AgentSession:
         self.stm.clear()
         self.stm.add("system", SYSTEM_PROMPT)
 
-    # ── LLM calling ─────────────────────────────────────────────────────
-
-    def _get_tool_block(self) -> str:
-        """Build (once) and return the tool-use instruction block."""
-        if self._tool_block is not None:
-            return self._tool_block
-        descs = self.tools.get_tool_descriptions()
-        parts = [
-            "\n\n你可以在回答前使用以下工具获取信息。如果需要使用工具，输出格式为：",
-            "THOUGHT: <你的思考过程>",
-            "ACTION: <工具名称>",
-            'PARAMS: {"参数名": "参数值"}',
-            "",
-            "工具列表：",
-        ]
-        for t in descs:
-            parts.append(f"- {t['name']}: {t['description']}")
-            if t["parameters"]:
-                for pname, pinfo in t["parameters"].items():
-                    parts.append(f"  参数 {pname}: {pinfo.get('description', '')}")
-        self._tool_block = "\n".join(parts)
-        return self._tool_block
-
-    def _call_llm(self, temperature: float = 0.3, tool_calls: int = 0) -> str:
-        """Call DeepSeek API and handle tool use via prompt-based function calling.
-
-        The system prompt inside STM is always kept clean — tool instructions
-        are injected only into the outgoing request, so recursive calls never
-        see a duplicated tool block.
-        """
+    def _call_llm(self, temperature: float = 0.3) -> str:
+        """Call DeepSeek API and handle tool use via prompt-based function calling."""
         messages = self.stm.to_llm_format()
         tool_block = self._get_tool_block()
 
@@ -195,49 +168,41 @@ class AgentSession:
             else:
                 augmented_messages.append(msg)
 
-        # Buffer the entire stream so we can inspect it for tool calls.
-        buffer: list[str] = []
-        try:
-            for token in chat_completion_stream(
-                self.api_key, self.base_url, augmented_messages,
-                temperature=temperature, max_tokens=4096, timeout=90,
-            ):
-                buffer.append(token)
-        except Exception:
-            # Streaming failed — fall back to non-streaming call.
-            content = chat_completion(
-                self.api_key, self.base_url, augmented_messages,
-                temperature=temperature, max_tokens=4096, timeout=90, retries=1,
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": "deepseek-chat",
+            "messages": augmented_messages,
+            "temperature": temperature,
+            "max_tokens": 4096
+        }
+
+        with httpx.Client(timeout=90) as client:
+            resp = client.post(
+                f"{self.base_url}/chat/completions",
+                headers=headers,
+                json=payload
             )
-            buffer = [content]
+            resp.raise_for_status()
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
 
-        content = "".join(buffer)
-
-        # Tool-use loop.
+        # Check if the LLM wants to use a tool
         tool_result = self._parse_tool_call(content)
         if tool_result:
-            if tool_calls >= 3:
-                yield "抱歉，查询所需的工具调用次数过多。请缩小问题范围后重试。"
-                return
             tool_name, params = tool_result
             result = self._execute_tool(tool_name, params)
             self.stm.add("tool", result, tool_name=tool_name)
-            yield from self._call_llm_stream(temperature, tool_calls + 1)
-            return
+            return self._call_llm(temperature)
 
-        # Final response — stream cleaned content in readable chunks.
-        cleaned = self._clean_response(content)
-        for start in range(0, len(cleaned), 64):
-            yield cleaned[start:start + 64]
+        # Strip internal reasoning prefix before returning to user
+        content = self._clean_response(content)
+        return content
 
-    # ── helpers ─────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _clean_response(content: str) -> str:
-        """Strip THOUGHT: lines when the response does NOT contain a tool call.
-
-        O(n) — scans lines twice at most.
-        """
+    def _clean_response(self, content: str) -> str:
+        """Remove internal THOUGHT: prefix if present and not followed by a tool call."""
         lines = content.split("\n")
         # Pre-compute: are there ACTION lines?  If yes, keep everything for parsing.
         has_action = any(l.strip().startswith("ACTION:") for l in lines)
@@ -264,17 +229,16 @@ class AgentSession:
         return None
 
     def _execute_tool(self, tool_name: str, params: dict) -> str:
-        """Dispatch *tool_name* to the matching method on self.tools."""
-        tools = self.tools
-        # Resolve the method once then call with only the parameters it expects.
-        method = getattr(tools, tool_name, None)
-        if method is None:
-            return f"未知工具: {tool_name}"
-
-        param_names = self._TOOL_PARAM_MAP.get(tool_name, [])
-        kwargs = {p: params.get(p, "") for p in param_names}
-        try:
-            return method(**kwargs)
-        except TypeError:
-            # Fallback for no-arg tools (e.g. list_minors).
-            return method()
+        """Execute a tool and return its result."""
+        tool_map = {
+            "list_minors": lambda: self.tools.list_minors(),
+            "search_minors": lambda: self.tools.search_minors(params.get("keyword", "")),
+            "get_minor_detail": lambda: self.tools.get_minor_detail(params.get("name", "")),
+            "check_eligibility": lambda: self.tools.check_eligibility(
+                params.get("major", ""), params.get("minor_name", "")
+            )
+        }
+        func = tool_map.get(tool_name)
+        if func:
+            return func()
+        return f"未知工具: {tool_name}"

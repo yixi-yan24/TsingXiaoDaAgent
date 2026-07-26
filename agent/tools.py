@@ -9,9 +9,6 @@ class Tools:
     def __init__(self, long_term_memory: LongTermMemory, api_key: str = "", course_catalog: Optional[CourseCatalog] = None):
         self.ltm = long_term_memory
         self._api_key = api_key
-        self.course_catalog = course_catalog or CourseCatalog.load()
-        # Lazily-initialised caches.
-        self._multi_agent_system = None
 
     def list_minors(self, group_by_department: bool = True) -> str:
         """列出所有可用的辅修专业（按院系分组）。"""
@@ -165,25 +162,6 @@ class Tools:
             f"限制说明：{restrictions}\n"
             f"注意：辅修学位要求与主修专业归属不同专业类，请确认二者的专业类关系。"
         )
-
-    def semantic_search(self, query: str) -> str:
-        """【语义搜索】使用词嵌入（Word Embedding）进行语义相似度搜索，理解查询意图而非仅匹配关键词。"""
-        try:
-            from .embedding import semantic_search as _semantic_search
-            # Reuse the already-loaded minors from long-term memory — no re-parse.
-            results = _semantic_search(query, self.ltm.minors, top_k=5)
-            if not results:
-                return f"语义搜索未找到与 '{query}' 相关的辅修专业。"
-            lines = [f"词嵌入语义搜索 '{query}' 的结果（按相关度排序）："]
-            for m, score in results:
-                lines.append(f"\n【{m.name}】({m.department}) [相似度: {score:.3f}]")
-                lines.append(f"  学分：{m.total_credits or '见方案'}")
-                lines.append(f"  限制：{m.major_restrictions[:100] or '无'}")
-            return "\n".join(lines)
-        except ImportError:
-            return "语义搜索不可用：请安装 sentence-transformers 以启用词嵌入功能。"
-        except Exception as e:
-            return f"语义搜索出错: {e}"
 
     def multi_agent_search(self, major: str, interests: str, grade: str = "") -> str:
         """【Multi-Agent 协同搜索】使用多个专业子 Agent 协同分析学生需求，推荐最适配的辅修专业。"""

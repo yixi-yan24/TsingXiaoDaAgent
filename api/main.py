@@ -129,40 +129,9 @@ def chat_completions(request: ChatCompletionRequest):
         raise HTTPException(status_code=400, detail="消息中缺少 user 角色消息")
 
     try:
-        with _sessions_lock:
-            sid, session, session_lock = _get_or_create_session(request.user)
-        with session_lock:
-            # Seed STM with prior conversation when the session is fresh.
-            if len(session.stm.messages) <= 1 and len(request.messages) > 1:
-                for msg in request.messages[:-1]:
-                    if msg.role in ("user", "assistant"):
-                        session.stm.add(msg.role, msg.content)
-
-            if request.stream:
-                # True SSE streaming — tokens from the final LLM turn are
-                # relayed as they are produced (tool-call loops run internally).
-                chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-                created = int(time.time())
-
-                def _stream_from_agent():
-                    yield _sse_chunk(chat_id, created, request.model,
-                                     {"role": "assistant", "content": ""}, None)
-                    for token in session.process_message_stream(
-                        user_content, temperature=request.temperature
-                    ):
-                        yield _sse_chunk(chat_id, created, request.model,
-                                         {"content": token}, None)
-                    yield _sse_chunk(chat_id, created, request.model, {}, "stop")
-                    yield "data: [DONE]\n\n"
-
-                return StreamingResponse(
-                    _stream_from_agent(), media_type="text/event-stream"
-                )
-
-            reply = session.process_message(user_content, temperature=request.temperature)
-    except Exception:
-        logger.exception("Chat completion failed")
-        raise HTTPException(status_code=502, detail="上游模型服务暂时不可用，请稍后重试")
+        reply = session.process_message(user_content)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
@@ -180,6 +149,18 @@ def chat_completions(request: ChatCompletionRequest):
         ],
         usage=Usage(total_tokens=0)
     )
+
+
+def _stream_response(chat_id: str, created: int, model: str, content: str):
+    """Generate SSE chunks for OpenAI-compatible streaming."""
+    # First chunk: role announcement
+    yield _sse_chunk(chat_id, created, model, {"role": "assistant", "content": ""}, None)
+    # Content chunks
+    for char in content:
+        yield _sse_chunk(chat_id, created, model, {"content": char}, None)
+    # Final chunk
+    yield _sse_chunk(chat_id, created, model, {}, "stop")
+    yield "data: [DONE]\n\n"
 
 
 def _sse_chunk(chat_id: str, created: int, model: str,

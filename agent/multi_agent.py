@@ -23,17 +23,21 @@ class SpecialistAgent:
         return response
 
     def _call_llm(self, temperature: float = 0.3) -> str:
-        # Preserve tool_name metadata in tool messages (maintenance safety).
-        messages = []
-        for m in self.memory.get_all():
-            content = m.content
-            if m.role == "tool" and m.tool_name:
-                content = f"[工具 {m.tool_name}] 结果: {content}"
-            messages.append({"role": m.role, "content": content})
-        return chat_completion(
-            self.api_key, self.base_url, messages,
-            temperature=temperature, max_tokens=2048, timeout=60, retries=1,
-        )
+        messages = [{"role": m.role, "content": m.content} for m in self.memory.get_all()]
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": "deepseek-chat",
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": 2048
+        }
+        with httpx.Client(timeout=60) as client:
+            resp = client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
 
 
 # === Specialized Agent Definitions ===

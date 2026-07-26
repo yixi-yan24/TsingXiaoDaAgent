@@ -149,7 +149,7 @@ def topological_sort(courses: list[Course]) -> list[list[Course]]:
     taken: set[str] = set()
     remaining: set[str] = set(course_map.keys())
 
-    SEMESTER_CYCLE = ["秋", "春", "夏"]
+    SEMESTER_CYCLE = ["秋", "春", "秋", "春", "秋", "春", "秋", "春"]
     semester_idx = 0
     # Track consecutive empty semesters to detect genuine deadlocks.
     empty_streak = 0
@@ -172,9 +172,19 @@ def topological_sort(courses: list[Course]) -> list[list[Course]]:
                 continue
 
             course = course_map[name]
-            if not _course_offered_in_semester(course, target_sem):
-                deferred.append(name)
-                continue
+
+            # Check semester compatibility
+            target_sem = SEMESTER_CYCLE[semester_idx % len(SEMESTER_CYCLE)]
+            if course.semester:
+                if "秋" in course.semester and target_sem == "春":
+                    # Can't take this semester, defer
+                    if name not in next_queue:
+                        next_queue.append(name)
+                    continue
+                if "春" in course.semester and target_sem == "秋":
+                    if name not in next_queue:
+                        next_queue.append(name)
+                    continue
 
             semester_courses.append(course)
             taken.add(name)
@@ -215,14 +225,17 @@ def format_plan(plan: list[list[Course]], student_grade: str = "大二") -> str:
     """Format the plan as a human-readable table."""
     grade_map = {"大一": 1, "大二": 2, "大三": 3, "大四": 4}
     current_grade_num = grade_map.get(student_grade, 2)
-    semester_labels = ["秋", "春", "夏"]
+    semester_labels = ["秋", "春", "秋", "春", "秋", "春", "秋", "春"]
+    year_labels = ["大二", "大二", "大三", "大三", "大四", "大四"]
 
     lines = ["📋 **拓扑排序算法生成的最优修读计划**\n"]
     lines.append("| 学期 | 课程名称 | 学分 | 类型 |")
     lines.append("|------|----------|------|------|")
 
     for i, semester_courses in enumerate(plan):
-        year_idx = current_grade_num - 1 + (i // 3)
+        if i >= len(semester_labels):
+            break
+        year_idx = current_grade_num - 1 + (i // 2)
         if year_idx >= 4:
             break
         year_label = f"{['大一','大二','大三','大四'][year_idx]}"
