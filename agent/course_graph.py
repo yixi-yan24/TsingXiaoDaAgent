@@ -173,17 +173,12 @@ def topological_sort(courses: list[Course]) -> list[list[Course]]:
 
             course = course_map[name]
 
-            # Check semester compatibility
-            target_sem = SEMESTER_CYCLE[semester_idx % len(SEMESTER_CYCLE)]
+            # Check semester compatibility (target_sem from outer loop)
             if course.semester:
-                if "秋" in course.semester and target_sem == "春":
+                if not _course_offered_in_semester(course, target_sem):
                     # Can't take this semester, defer
-                    if name not in next_queue:
-                        next_queue.append(name)
-                    continue
-                if "春" in course.semester and target_sem == "秋":
-                    if name not in next_queue:
-                        next_queue.append(name)
+                    if name not in deferred:
+                        deferred.append(name)
                     continue
 
             semester_courses.append(course)
@@ -239,7 +234,7 @@ def format_plan(plan: list[list[Course]], student_grade: str = "大二") -> str:
         if year_idx >= 4:
             break
         year_label = f"{['大一','大二','大三','大四'][year_idx]}"
-        sem_label = semester_labels[i % 3]
+        sem_label = semester_labels[i]
         lines.append(f"| **{year_label} {sem_label}** | | | |")
         for course in semester_courses:
             lines.append(f"| | {course.name} | {course.credits} | {course.course_type} |")

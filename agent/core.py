@@ -1,5 +1,9 @@
 import json, re
+from collections.abc import Generator
+
 import httpx
+
+from .llm_client import chat_completion, chat_completion_stream
 from .memory import ShortTermMemory, LongTermMemory
 from .tools import Tools
 from .planner import CoursePlanner
@@ -79,7 +83,7 @@ class AgentSession:
         self.stm.add("user", user_message)
 
         # Get response from LLM
-        response = self._call_llm()
+        response = self._call_llm(temperature=temperature)
         self.stm.add("assistant", response)
         return response
 
@@ -113,7 +117,27 @@ class AgentSession:
         self.stm.clear()
         self.stm.add("system", SYSTEM_PROMPT)
 
-    def _call_llm(self, temperature: float = 0.3) -> str:
+    # ── internal ────────────────────────────────────────────────────────
+
+    def _get_tool_block(self) -> str:
+        """Build (and cache) the tool-use instructions block."""
+        if self._tool_block is not None:
+            return self._tool_block
+        tool_descriptions = self.tools.get_tool_descriptions()
+        block = "\n\n你可以在回答前使用以下工具获取信息。如果需要使用工具，输出格式为：\n"
+        block += "THOUGHT: <你的思考过程>\n"
+        block += "ACTION: <工具名称>\n"
+        block += "PARAMS: {\"参数名\": \"参数值\"}\n\n"
+        block += "工具列表：\n"
+        for t in tool_descriptions:
+            block += f"- {t['name']}: {t['description']}\n"
+            if t['parameters']:
+                for pname, pinfo in t['parameters'].items():
+                    block += f"  参数 {pname}: {pinfo.get('description', '')}\n"
+        self._tool_block = block
+        return block
+
+    def _call_llm(self, temperature: float = 0.3, tool_calls: int = 0) -> str:
         """Call DeepSeek API and handle tool use via prompt-based function calling."""
         messages = self.stm.to_llm_format()
         tool_block = self._get_tool_block()
@@ -151,9 +175,10 @@ class AgentSession:
     ) -> Generator[str, None, None]:
         """Streaming variant of _call_llm.
 
-        Buffers the LLM stream internally so tool calls can still be parsed
-        from the complete response.  Only the **final** turn (no tool call)
-        yields tokens to the caller — earlier turns are consumed silently.
+        Uses true SSE streaming from DeepSeek.  Tokens are buffered internally
+        so tool calls can still be parsed from the complete response.  Only the
+        **final** turn (no tool call) yields tokens to the caller — earlier
+        turns are consumed silently.
         """
         messages = self.stm.to_llm_format()
         tool_block = self._get_tool_block()
@@ -168,38 +193,32 @@ class AgentSession:
             else:
                 augmented_messages.append(msg)
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": "deepseek-chat",
-            "messages": augmented_messages,
-            "temperature": temperature,
-            "max_tokens": 4096
-        }
+        # Stream from DeepSeek — buffer tokens so we can inspect for tool calls.
+        buffered: list[str] = []
+        for token in chat_completion_stream(
+            self.api_key, self.base_url, augmented_messages,
+            temperature=temperature, max_tokens=4096, timeout=90,
+        ):
+            buffered.append(token)
 
-        with httpx.Client(timeout=90) as client:
-            resp = client.post(
-                f"{self.base_url}/chat/completions",
-                headers=headers,
-                json=payload
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"]
+        content = "".join(buffered)
 
         # Check if the LLM wants to use a tool
         tool_result = self._parse_tool_call(content)
         if tool_result:
+            if tool_calls >= 3:
+                yield "抱歉，查询所需的工具调用次数过多。请缩小问题范围后重试。"
+                return
             tool_name, params = tool_result
             result = self._execute_tool(tool_name, params)
             self.stm.add("tool", result, tool_name=tool_name)
-            return self._call_llm(temperature)
+            yield from self._call_llm_stream(temperature, tool_calls + 1)
+            return
 
-        # Strip internal reasoning prefix before returning to user
+        # Final turn — yield cleaned content character by character.
         content = self._clean_response(content)
-        return content
+        for char in content:
+            yield char
 
     def _clean_response(self, content: str) -> str:
         """Remove internal THOUGHT: prefix if present and not followed by a tool call."""
@@ -234,9 +253,16 @@ class AgentSession:
             "list_minors": lambda: self.tools.list_minors(),
             "search_minors": lambda: self.tools.search_minors(params.get("keyword", "")),
             "get_minor_detail": lambda: self.tools.get_minor_detail(params.get("name", "")),
+            "search_courses": lambda: self.tools.search_courses(params.get("keyword", "")),
+            "get_course_detail": lambda: self.tools.get_course_detail(params.get("identifier", "")),
+            "list_minor_courses": lambda: self.tools.list_minor_courses(params.get("minor_name", "")),
             "check_eligibility": lambda: self.tools.check_eligibility(
                 params.get("major", ""), params.get("minor_name", "")
-            )
+            ),
+            "semantic_search": lambda: self.tools.semantic_search(params.get("query", "")),
+            "multi_agent_search": lambda: self.tools.multi_agent_search(
+                params.get("major", ""), params.get("interests", ""), params.get("grade", "")
+            ),
         }
         func = tool_map.get(tool_name)
         if func:

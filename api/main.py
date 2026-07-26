@@ -129,12 +129,33 @@ def chat_completions(request: ChatCompletionRequest):
         raise HTTPException(status_code=400, detail="消息中缺少 user 角色消息")
 
     try:
-        reply = session.process_message(user_content)
+        with _sessions_lock:
+            _, session, session_lock = _get_or_create_session(request.user)
+        with session_lock:
+            # Populate session history from request for stateless clients
+            # (e.g. Page Assist that doesn't pass a user field).
+            if len(session.stm.messages) <= 1 and len(request.messages) > 1:
+                for msg in request.messages[:-1]:
+                    if msg.role in ("user", "assistant"):
+                        session.stm.add(msg.role, msg.content)
+
+            if request.stream:
+                token_gen = session.process_message_stream(user_content, temperature=request.temperature)
+                reply = None  # filled after streaming completes
+            else:
+                reply = session.process_message(user_content, temperature=request.temperature)
     except Exception as e:
+        logger.exception("Chat completion failed")
         raise HTTPException(status_code=500, detail=str(e))
 
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
+
+    if request.stream:
+        return StreamingResponse(
+            _stream_response(chat_id, created, request.model, token_gen),
+            media_type="text/event-stream"
+        )
 
     return ChatCompletionResponse(
         id=chat_id,
@@ -151,13 +172,13 @@ def chat_completions(request: ChatCompletionRequest):
     )
 
 
-def _stream_response(chat_id: str, created: int, model: str, content: str):
-    """Generate SSE chunks for OpenAI-compatible streaming."""
+def _stream_response(chat_id: str, created: int, model: str, tokens):
+    """Generate SSE chunks from a token generator (real progressive streaming)."""
     # First chunk: role announcement
     yield _sse_chunk(chat_id, created, model, {"role": "assistant", "content": ""}, None)
-    # Content chunks
-    for char in content:
-        yield _sse_chunk(chat_id, created, model, {"content": char}, None)
+    # Content chunks — one SSE event per token from the live generator
+    for token in tokens:
+        yield _sse_chunk(chat_id, created, model, {"content": token}, None)
     # Final chunk
     yield _sse_chunk(chat_id, created, model, {}, "stop")
     yield "data: [DONE]\n\n"
